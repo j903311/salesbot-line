@@ -12,6 +12,6 @@
     "express": "^4.19.2",
     "dotenv": "^16.4.5",
     "dayjs": "^1.11.11",
-    "googleapis": "^141.0.0"
+    "googleapis": "^139.0.0"
   }
 }

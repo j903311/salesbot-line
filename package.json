@@ -1,0 +1,17 @@
+{
+  "name": "salesbot-line",
+  "version": "1.0.0",
+  "description": "LINE 業務分身 Bot：查價、庫存、下單（中文回覆版）",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@line/bot-sdk": "^9.0.2",
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5",
+    "dayjs": "^1.11.11",
+    "googleapis": "^141.0.0"
+  }
+}

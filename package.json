@@ -2,11 +2,11 @@
   "name": "line-bot-sales-assistant",
   "version": "3.0.0",
   "description": "LINE Bot for pricing, stock, and order management (with fuzzy search & context memory)",
-  "main": "server_v3.js",
+  "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server_v3.js",
-    "dev": "node server_v3.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "@line/bot-sdk": "^9.0.2",

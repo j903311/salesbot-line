@@ -1,4 +1,8 @@
-// server_v3.js — 修正版：支援換行與多筆查編號
+// server_v3.js — 查編號多行穩定版（修正換行符 , \n, U+2028/U+2029）
+// - 支援：查編號 多行/空白/頓號/逗號 分隔
+// - 規則：找到的才顯示「代碼 書名」，找不到就略過
+// - 仍保留：查價、庫存（單筆/多筆皆可）
+
 import express from "express";
 import { Client, middleware } from "@line/bot-sdk";
 import dotenv from "dotenv";
@@ -29,7 +33,7 @@ async function fetchProducts() {
   const res = await sheets.spreadsheets.values.get({
     auth: authClient,
     spreadsheetId: sheetId,
-    range: `${tabProducts}!A:D`,
+    range: `${tabProducts}!A:D`, // code,name,price,stock
   });
   const rows = res.data.values;
   if (!rows || rows.length < 2) return [];
@@ -41,26 +45,27 @@ async function fetchProducts() {
     stock: header.indexOf("stock"),
   };
   return data.map(r => ({
-    code: r[idx.code],
-    name: r[idx.name],
-    price: r[idx.price],
-    stock: r[idx.stock],
+    code: (r[idx.code] ?? "").toString().trim(),
+    name: (r[idx.name] ?? "").toString().trim(),
+    price: (r[idx.price] ?? "").toString().trim(),
+    stock: (r[idx.stock] ?? "").toString().trim(),
   }));
 }
 
-// 模糊搜尋（支援部分字匹配）
+// 模糊搜尋（子字串匹配）
 function searchProductFuzzy(list, keyword) {
   if (!keyword) return null;
   const normalized = keyword.replace(/\s+/g, "").toLowerCase();
-  let exact = list.find(p => p.name.replace(/\s+/g, "").toLowerCase() === normalized);
+  // 完整相等
+  let exact = list.find(p => (p.name || "").replace(/\s+/g, "").toLowerCase() === normalized);
   if (exact) return exact;
-  const partial = list.filter(p => p.name.toLowerCase().includes(normalized));
+  // 包含匹配
+  const partial = list.filter(p => (p.name || "").toLowerCase().includes(normalized));
   if (partial.length === 1) return partial[0];
   if (partial.length > 1) return { multi: partial };
   return null;
 }
 
-// replyText
 function replyText(token, text) {
   return client.replyMessage(token, { type: "text", text });
 }
@@ -77,7 +82,7 @@ async function replyPrice(token, keyword) {
   return replyText(token, `${item.code} ${item.name}\n定價：${item.price} 元\n庫存：${item.stock}`);
 }
 
-// 查庫存
+// 庫存
 async function replyStock(token, keyword) {
   const list = await fetchProducts();
   const item = searchProductFuzzy(list, keyword);
@@ -89,16 +94,19 @@ async function replyStock(token, keyword) {
   return replyText(token, `${item.code} ${item.name}\n庫存：${item.stock}`);
 }
 
-// 查編號（支援換行與多筆輸入）
+// 查編號（多行穩定版）
 async function replyCodeOnly(token, keyword) {
   const list = await fetchProducts();
-  const keywords = keyword.split(/[\n\s,，、]+/).filter(Boolean);
+  // 將各種換行符（\r, \n, U+2028, U+2029）統一成 \n，再分割
+  const cleaned = keyword.replace(/[\r\u2028\u2029]+/g, "\n");
+  const keywords = cleaned.split(/[\n\s,，、;；]+/).filter(Boolean);
   const results = [];
 
   for (const k of keywords) {
     const item = searchProductFuzzy(list, k);
-    if (!item) continue;
+    if (!item) continue; // 找不到就略過
     if (item.multi) {
+      // 多筆命中時取第一筆（避免輸出過長）
       const first = item.multi[0];
       results.push(`${first.code} ${first.name}`);
     } else {
@@ -110,17 +118,15 @@ async function replyCodeOnly(token, keyword) {
   return replyText(token, results.join("\n"));
 }
 
-// handleEvent
+// 事件處理
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
-  const textRaw = (event.message.text || "").trim();
+  // 原文保留，避免把中間換行吃掉
+  const textRaw = (event.message.text ?? "").trim();
 
-  // 修正版：允許查編號後換行
+  // ✅ 修正：允許「查編號」後換行；保留換行給 replyCodeOnly 去切
   if (textRaw.startsWith("查編號")) {
-    const keyword = textRaw
-      .replace(/^查編號/, "")
-      .replace(/\r?\n+/g, " ")
-      .trim();
+    const keyword = textRaw.replace(/^查編號/, "").replace(/^\s+/, "");
     return replyCodeOnly(event.replyToken, keyword);
   }
   if (/^(查價|報價)/.test(textRaw)) {

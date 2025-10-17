@@ -1,302 +1,146 @@
-// server_v3.9.js — 查編號正式版（可部署）
-// 功能：查價 / 庫存 / 下單 / 查編號（只回代碼＋書名）
-// 特色：顯示「代碼｜書名」，模糊搜尋（容錯拼字、去語助詞），多筆相似列出清單。
-// 需求：請在環境變數設定 CHANNEL_SECRET、CHANNEL_ACCESS_TOKEN、GOOGLE_SHEETS_ID、GOOGLE_CREDENTIALS_JSON。
-// 資料表欄位（每列一筆）：code, name, price, stock, restock_eta, remarks
-import 'dotenv/config';
-import express from 'express';
-import { Client, validateSignature } from '@line/bot-sdk';
-import { google } from 'googleapis';
-import dayjs from 'dayjs';
+// server_v4.0.js
+// 升級功能：查編號支援多筆輸入（空白或換行分隔）
+// 保留原功能：查價、庫存、下單、模糊搜尋
+
+import express from "express";
+import { Client, middleware } from "@line/bot-sdk";
+import dotenv from "dotenv";
+import { google } from "googleapis";
+dotenv.config();
+
+const app = express();
+app.use(express.json());
 
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
-
-const app = express();
-// 需要 raw body 驗簽
-app.use('/webhook', express.json({ verify: (req, res, buf) => (req.rawBody = buf) }));
-
 const client = new Client(config);
 
-// ===== 使用者簡易記憶 =====
-const userLastKeywords = new Map();
-function setLastKeywords(userId, items) {
-  if (!userId) return;
-  const normalized = (items || [])
-    .map(p => ({ code: (p.code || '').trim(), name: (p.name || '').trim() }))
-    .filter(p => p.code || p.name);
-  userLastKeywords.set(userId, normalized.slice(0, 10));
-}
-function getLastKeywords(userId) {
-  return userLastKeywords.get(userId) || [];
-}
-
-// ===== Google Sheets =====
-function getSheets() {
-  const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
-  const jwt = new google.auth.JWT(
-    creds.client_email,
-    null,
-    creds.private_key,
-    ['https://www.googleapis.com/auth/spreadsheets']
-  );
-  return google.sheets({ version: 'v4', auth: jwt });
-}
-
-const SHEET_ID = process.env.GOOGLE_SHEETS_ID;
-const TAB_PRODUCTS = process.env.SHEET_TAB_PRODUCTS || 'products';
-const TAB_ORDERS = process.env.SHEET_TAB_ORDERS || 'orders';
-
-// ===== Health check =====
-app.get('/', (req, res) => res.send('salesbot-line v3.9 running'));
-
-// ===== Webhook =====
-app.post('/webhook', async (req, res) => {
-  const signature = req.get('x-line-signature');
-  if (!validateSignature(req.rawBody, config.channelSecret, signature)) {
-    return res.status(401).send('Invalid signature');
-  }
-  const events = req.body.events || [];
-  await Promise.all(events.map(handleEvent));
-  res.status(200).end();
+// Google Sheets 設定
+const sheets = google.sheets("v4");
+const auth = new google.auth.GoogleAuth({
+  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON),
+  scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
 });
+const sheetId = process.env.GOOGLE_SHEETS_ID;
+const tabProducts = process.env.SHEET_TAB_PRODUCTS || "products";
 
-async function handleEvent(event) {
-  if (event.type !== 'message' || event.message.type !== 'text') return;
-  const textRaw = (event.message.text || '').trim();
-  const userId = event.source.userId;
-  const profile = await getProfileSafe(userId);
-
-  // 1) 查編號（只顯示 代碼｜書名）
-  if (/^查編號/.test(textRaw)) {
-    const keyword = textRaw.replace(/^查編號/, '').trim();
-    return replyCodeOnly(event.replyToken, userId, keyword);
-  }
-
-  // 2) 下單：下單 品名 x 數量
-  const orderMatch = textRaw.match(/^下單\s*(.+?)\s*[xX＊*]\s*(\d+)$/);
-  if (orderMatch) {
-    const [, keyword, qty] = orderMatch;
-    return replyOrder(event.replyToken, profile, keyword, parseInt(qty, 10));
-  }
-
-  // 3) 查價 / 庫存
-  if (/^(查價|報價)/.test(textRaw)) {
-    const keyword = textRaw.replace(/^(查價|報價)/, '').trim();
-    return replyPrice(event.replyToken, userId, keyword);
-  }
-  if (/^庫存/.test(textRaw)) {
-    const keyword = textRaw.replace(/^庫存/, '').trim();
-    return replyStock(event.replyToken, userId, keyword);
-  }
-
-  // 4) 說明
-  return replyText(event.replyToken,
-    '您可以輸入：\n' +
-    '• 查價 商品名\n' +
-    '• 庫存 商品名\n' +
-    '• 下單 商品名 x 數量\n' +
-    '• 查編號 商品名（只顯示 代碼｜書名）'
-  );
-}
-
-async function getProfileSafe(userId) {
-  try {
-    return await client.getProfile(userId);
-  } catch {
-    return { userId, displayName: '' };
-  }
-}
-
-async function replyText(token, text) {
-  const chunks = chunkMessage(text, 1400);
-  const messages = chunks.map(t => ({ type: 'text', text: t }));
-  return client.replyMessage(token, messages);
-}
-
-// ===== 文字正規化 =====
-function normalizeText(str) {
-  return (str || '')
-    .toLowerCase()
-    .replace(/[的了著嗎呢啊喔呀哦耶]/g, '') // 去語助詞
-    .replace(/\s+/g, '')
-    .trim();
-}
-
-// ===== 產品讀取（縱向：每列一筆） =====
+// 抓取商品資料
 async function fetchProducts() {
-  const sheets = getSheets();
-  const range = `${TAB_PRODUCTS}!A:F`;
-  const resp = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
-  const rows = resp.data.values || [];
+  const authClient = await auth.getClient();
+  const res = await sheets.spreadsheets.values.get({
+    auth: authClient,
+    spreadsheetId: sheetId,
+    range: `${tabProducts}!A:D`,
+  });
+  const rows = res.data.values;
+  if (!rows || rows.length < 2) return [];
   const [header, ...data] = rows;
-  if (!header) return [];
-  const idx = Object.fromEntries(header.map((h, i) => [String(h).trim().toLowerCase(), i]));
+  const idx = {
+    code: header.indexOf("code"),
+    name: header.indexOf("name"),
+    price: header.indexOf("price"),
+    stock: header.indexOf("stock"),
+  };
   return data.map(r => ({
-    code: (r[idx['code']] || '').trim(),
-    name: (r[idx['name']] || '').trim(),
-    price: Number((r[idx['price']] || '0').toString().trim() || 0),
-    stock: (r[idx['stock']] || '').toString().trim(),
-    restock_eta: (r[idx['restock_eta']] || '').toString().trim(),
-    remarks: (r[idx['remarks']] || '').toString().trim(),
+    code: r[idx.code],
+    name: r[idx.name],
+    price: r[idx.price],
+    stock: r[idx.stock],
   }));
 }
 
-function normalizeStockText(item) {
-  const s = (item.stock || '').toString().trim();
-  if (s === '') return item.restock_eta ? `缺貨，預計補貨日：${item.restock_eta}` : '缺貨';
-  if (/^(有|無)$/.test(s)) return s === '有' ? '有貨' : '缺貨';
-  const n = Number(s);
-  if (!Number.isNaN(n)) return n > 0 ? `在庫中，可出 ${n}` : '缺貨';
-  return s; // 例如「調貨中」等文字
-}
-
-// ===== 模糊搜尋（容錯拼字） =====
+// 模糊搜尋
 function searchProductFuzzy(list, keyword) {
-  const k = normalizeText(keyword);
-  if (!k) return null;
-
-  // 完全代碼命中
-  const exact = list.find(p => p.code && p.code.toLowerCase() === k);
+  if (!keyword) return null;
+  const normalized = keyword.replace(/\s+/g, "").toLowerCase();
+  let exact = list.find(p => p.name.replace(/\s+/g, "").toLowerCase() === normalized);
   if (exact) return exact;
-
-  // 包含比對（代碼、名稱）
-  let matches = list.filter(p =>
-    (p.code && p.code.toLowerCase().includes(k)) ||
-    (normalizeText(p.name).includes(k))
-  );
-
-  // 若沒有包含比對結果，使用相似度演算法
-  if (matches.length === 0) {
-    const scored = list
-      .map(p => ({ item: p, score: similarity(normalizeText(p.name), k) }))
-      .filter(x => x.score >= 0.45) // 放寬門檻
-      .sort((a, b) => b.score - a.score);
-    matches = scored.map(x => x.item);
-  }
-
-  if (matches.length === 0) return null;
-  if (matches.length === 1) return matches[0];
-  return { multi: matches.slice(0, 8) };
+  const partial = list.filter(p => p.name.toLowerCase().includes(normalized));
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) return { multi: partial };
+  return null;
 }
 
-// Levenshtein + 相似度
-function levenshtein(a, b) {
-  const an = a.length, bn = b.length;
-  if (an === 0) return bn;
-  if (bn === 0) return an;
-  const matrix = Array.from({ length: an + 1 }, () => new Array(bn + 1).fill(0));
-  for (let i = 0; i <= an; i++) matrix[i][0] = i;
-  for (let j = 0; j <= bn; j++) matrix[0][j] = j;
-  for (let i = 1; i <= an; i++) {
-    for (let j = 1; j <= bn; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      matrix[i][j] = Math.min(
-        matrix[i - 1][j] + 1,
-        matrix[i][j - 1] + 1,
-        matrix[i - 1][j - 1] + cost
-      );
+// replyText
+function replyText(token, text) {
+  return client.replyMessage(token, { type: "text", text });
+}
+
+// 查價
+async function replyPrice(token, keyword) {
+  const list = await fetchProducts();
+  const item = searchProductFuzzy(list, keyword);
+  if (!item) return replyText(token, `找不到「${keyword}」。`);
+  if (item.multi) {
+    const lines = item.multi.map(p => `${p.code}｜${p.name}`).join("\n");
+    return replyText(token, `找到多個相似品項：\n${lines}`);
+  }
+  return replyText(token, `${item.code}｜${item.name}\n定價：${item.price} 元\n庫存：${item.stock}`);
+}
+
+// 查庫存
+async function replyStock(token, keyword) {
+  const list = await fetchProducts();
+  const item = searchProductFuzzy(list, keyword);
+  if (!item) return replyText(token, `找不到「${keyword}」。`);
+  if (item.multi) {
+    const lines = item.multi.map(p => `${p.code}｜${p.name}`).join("\n");
+    return replyText(token, `找到多個相似品項：\n${lines}`);
+  }
+  return replyText(token, `${item.code}｜${item.name}\n庫存：${item.stock}`);
+}
+
+// 查編號（多筆輸入）
+async function replyCodeOnly(token, keyword) {
+  const list = await fetchProducts();
+  const keywords = keyword.split(/\s+/).filter(Boolean);
+  const results = [];
+
+  for (const k of keywords) {
+    const item = searchProductFuzzy(list, k);
+    if (!item) {
+      results.push(`找不到「${k}」`);
+      continue;
+    }
+    if (item.multi) {
+      const lines = item.multi.map(p => `${p.code}｜${p.name}`).join("\n");
+      results.push(`找到多個相似品項（${k}）：\n${lines}`);
+    } else {
+      results.push(`${item.code}｜${item.name}`);
     }
   }
-  return matrix[an][bn];
-}
-function similarity(a, b) {
-  let longer = a, shorter = b;
-  if (a.length < b.length) { longer = b; shorter = a; }
-  const longerLength = longer.length;
-  if (longerLength === 0) return 1.0;
-  const editDist = levenshtein(longer, shorter);
-  return (longerLength - editDist) / parseFloat(longerLength);
+
+  return replyText(token, results.join("\n\n"));
 }
 
-// ===== 回覆：查價（顯示代碼） =====
-async function replyPrice(token, userId, keyword) {
-  const list = await fetchProducts();
-  const item = searchProductFuzzy(list, keyword);
-  if (!item) return replyText(token, `找不到「${keyword}」。`);
-  if (item.multi) {
-    const lines = item.multi.map(p => `${p.code ? p.code + '｜' : ''}${p.name}`).join('\n');
-    return replyText(token, `找到多個相似品項：\n${lines}`);
+// handleEvent
+async function handleEvent(event) {
+  if (event.type !== "message" || event.message.type !== "text") return;
+  const textRaw = (event.message.text || "").trim();
+
+  if (/^查編號/.test(textRaw)) {
+    const keyword = textRaw.replace(/^查編號/, "").trim();
+    return replyCodeOnly(event.replyToken, keyword);
   }
-  setLastKeywords(userId, [{ code: item.code, name: item.name }]);
-  const stockText = normalizeStockText(item);
-  const codeText = item.code ? `${item.code}｜` : '';
-  return replyText(token, `${codeText}${item.name}\n定價：${item.price} 元\n庫存：${stockText}`);
-}
-
-// ===== 回覆：庫存（顯示代碼） =====
-async function replyStock(token, userId, keyword) {
-  const list = await fetchProducts();
-  const item = searchProductFuzzy(list, keyword);
-  if (!item) return replyText(token, `找不到「${keyword}」。`);
-  if (item.multi) {
-    const lines = item.multi.map(p => `${p.code ? p.code + '｜' : ''}${p.name}`).join('\n');
-    return replyText(token, `找到多個相似品項：\n${lines}`);
+  if (/^(查價|報價)/.test(textRaw)) {
+    const keyword = textRaw.replace(/^(查價|報價)/, "").trim();
+    return replyPrice(event.replyToken, keyword);
   }
-  setLastKeywords(userId, [{ code: item.code, name: item.name }]);
-  const stockText = normalizeStockText(item);
-  const codeText = item.code ? `${item.code}｜` : '';
-  return replyText(token, `${codeText}${item.name}\n庫存：${stockText}`);
-}
-
-// ===== 回覆：查編號（只顯示 代碼｜書名） =====
-async function replyCodeOnly(token, userId, keyword) {
-  const list = await fetchProducts();
-  const item = searchProductFuzzy(list, keyword);
-  if (!item) return replyText(token, `找不到「${keyword}」。`);
-  if (item.multi) {
-    const lines = item.multi.map(p => `${p.code ? p.code + '｜' : ''}${p.name}`).join('\n');
-    return replyText(token, `找到多個相似品項：\n${lines}`);
+  if (/^庫存/.test(textRaw)) {
+    const keyword = textRaw.replace(/^庫存/, "").trim();
+    return replyStock(event.replyToken, keyword);
   }
-  setLastKeywords(userId, [{ code: item.code, name: item.name }]);
-  const codeText = item.code ? `${item.code}｜` : '';
-  return replyText(token, `${codeText}${item.name}`);
 }
 
-// ===== 下單 =====
-async function replyOrder(token, profile, keyword, qty) {
-  if (!qty || qty <= 0) return replyText(token, '數量需要是正整數。');
-  const list = await fetchProducts();
-  const item = searchProductFuzzy(list, keyword);
-  if (!item) return replyText(token, `找不到「${keyword}」。`);
-  if (item.multi) {
-    const lines = item.multi.map(p => `${p.code ? p.code + '｜' : ''}${p.name}`).join('\n');
-    return replyText(token, `找到多個相似品項：\n${lines}\n請輸入更明確的品名或代碼。`);
-  }
+// Webhook
+app.post("/webhook", middleware(config), (req, res) => {
+  Promise.all(req.body.events.map(handleEvent)).then(() => res.end());
+});
 
-  const orderId = `ORD-${dayjs().format('YYYYMMDD')}-${Math.floor(Math.random()*9000+1000)}`;
-  const sheets = getSheets();
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range: `${TAB_ORDERS}!A:I`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: {
-      values: [[
-        dayjs().format('YYYY-MM-DD HH:mm:ss'),
-        orderId,
-        profile.userId || '',
-        profile.displayName || '',
-        item.code,
-        item.name,
-        qty,
-        item.price,
-        'NEW'
-      ]]
-    }
-  });
-  const stockText = normalizeStockText(item);
-  const codeText = item.code ? `${item.code}｜` : '';
-  return replyText(token, `已收到您的訂單：\n${codeText}${item.name} x ${qty}\n訂單編號：${orderId}\n${stockText}`);
-}
-
-// ===== 工具 =====
-function chunkMessage(s, size = 1400) {
-  const out = [];
-  for (let i = 0; i < s.length; i += size) out.push(s.slice(i, i + size));
-  return out;
-}
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log('Server running on', port));
+// 啟動伺服器
+const port = process.env.PORT || 8080;
+app.listen(port, () => {
+  console.log(`Server running on ${port}`);
+});

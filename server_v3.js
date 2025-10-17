@@ -1,10 +1,4 @@
-// server_v3.js — 多行查編號升級版
-// 支援多筆輸入與模糊搜尋，找不到的不顯示。
-// 範例：
-// 查編號
-// 呼叫消防隊
-// 火車出發了
-
+// server_v3.js — 修正版：支援換行與多筆查編號
 import express from "express";
 import { Client, middleware } from "@line/bot-sdk";
 import dotenv from "dotenv";
@@ -54,7 +48,7 @@ async function fetchProducts() {
   }));
 }
 
-// 模糊搜尋
+// 模糊搜尋（支援部分字匹配）
 function searchProductFuzzy(list, keyword) {
   if (!keyword) return null;
   const normalized = keyword.replace(/\s+/g, "").toLowerCase();
@@ -95,7 +89,7 @@ async function replyStock(token, keyword) {
   return replyText(token, `${item.code} ${item.name}\n庫存：${item.stock}`);
 }
 
-// 查編號（多行、多筆輸入）
+// 查編號（支援換行與多筆輸入）
 async function replyCodeOnly(token, keyword) {
   const list = await fetchProducts();
   const keywords = keyword.split(/[\n\s,，、]+/).filter(Boolean);
@@ -121,8 +115,12 @@ async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return;
   const textRaw = (event.message.text || "").trim();
 
-  if (/^查編號/.test(textRaw)) {
-    const keyword = textRaw.replace(/^查編號/, "").trim();
+  // 修正版：允許查編號後換行
+  if (textRaw.startsWith("查編號")) {
+    const keyword = textRaw
+      .replace(/^查編號/, "")
+      .replace(/\r?\n+/g, " ")
+      .trim();
     return replyCodeOnly(event.replyToken, keyword);
   }
   if (/^(查價|報價)/.test(textRaw)) {

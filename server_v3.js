@@ -1,8 +1,4 @@
-// server_v3.9.js — 查編號正式版（可部署）
-// 功能：查價 / 庫存 / 下單 / 查編號（只回代碼＋書名）
-// 特色：顯示「代碼｜書名」，模糊搜尋（容錯拼字、去語助詞），多筆相似列出清單。
-// 需求：請在環境變數設定 CHANNEL_SECRET、CHANNEL_ACCESS_TOKEN、GOOGLE_SHEETS_ID、GOOGLE_CREDENTIALS_JSON。
-// 資料表欄位（每列一筆）：code, name, price, stock, restock_eta, remarks
+// server_v3.js — LINE 業務助理 Bot（多書名 + 模糊搜尋 + 上下文記憶：不自動過期，直到新查詢覆蓋）
 import 'dotenv/config';
 import express from 'express';
 import { Client, validateSignature } from '@line/bot-sdk';
@@ -15,12 +11,12 @@ const config = {
 };
 
 const app = express();
-// 需要 raw body 驗簽
 app.use('/webhook', express.json({ verify: (req, res, buf) => (req.rawBody = buf) }));
 
 const client = new Client(config);
 
-// ===== 使用者簡易記憶 =====
+// ====== 使用者上下文記憶（直到新查詢覆蓋，不自動過期） ======
+// 結構：userId -> [{code, name}]  最多僅儲存 10 筆
 const userLastKeywords = new Map();
 function setLastKeywords(userId, items) {
   if (!userId) return;
@@ -33,7 +29,18 @@ function getLastKeywords(userId) {
   return userLastKeywords.get(userId) || [];
 }
 
-// ===== Google Sheets =====
+// Webhook
+app.post('/webhook', async (req, res) => {
+  const signature = req.get('x-line-signature');
+  if (!validateSignature(req.rawBody, config.channelSecret, signature)) {
+    return res.status(401).send('Invalid signature');
+  }
+  const events = req.body.events || [];
+  await Promise.all(events.map(handleEvent));
+  res.status(200).end();
+});
+
+// Google Sheets
 function getSheets() {
   const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
   const jwt = new google.auth.JWT(
@@ -49,40 +56,31 @@ const SHEET_ID = process.env.GOOGLE_SHEETS_ID;
 const TAB_PRODUCTS = process.env.SHEET_TAB_PRODUCTS || 'products';
 const TAB_ORDERS = process.env.SHEET_TAB_ORDERS || 'orders';
 
-// ===== Health check =====
-app.get('/', (req, res) => res.send('salesbot-line v3.9 running'));
-
-// ===== Webhook =====
-app.post('/webhook', async (req, res) => {
-  const signature = req.get('x-line-signature');
-  if (!validateSignature(req.rawBody, config.channelSecret, signature)) {
-    return res.status(401).send('Invalid signature');
-  }
-  const events = req.body.events || [];
-  await Promise.all(events.map(handleEvent));
-  res.status(200).end();
-});
-
+// ===== 核心事件處理 =====
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
   const textRaw = (event.message.text || '').trim();
   const userId = event.source.userId;
   const profile = await getProfileSafe(userId);
 
-  // 1) 查編號（只顯示 代碼｜書名）
-  if (/^查編號/.test(textRaw)) {
-    const keyword = textRaw.replace(/^查編號/, '').trim();
-    return replyCodeOnly(event.replyToken, userId, keyword);
-  }
+  // 快速意圖判斷
+  const isPriceIntent = /(^|\n|\s)(查價|報價|多少錢)/.test(textRaw);
+  const isStockIntent = /(^|\n|\s)(庫存|有貨嗎|有沒有庫存|缺貨嗎)/.test(textRaw);
+  const hasMultiSplit = /\n|、|,|，|；|;/.test(textRaw);
 
-  // 2) 下單：下單 品名 x 數量
+  // 1) 下單：維持原有語法「下單 品名 x 數量」
   const orderMatch = textRaw.match(/^下單\s*(.+?)\s*[xX＊*]\s*(\d+)$/);
   if (orderMatch) {
     const [, keyword, qty] = orderMatch;
     return replyOrder(event.replyToken, profile, keyword, parseInt(qty, 10));
   }
 
-  // 3) 查價 / 庫存
+  // 2) 價格／庫存（支援多行、多關鍵字）
+  if (isPriceIntent || isStockIntent || hasMultiSplit) {
+    return handleMultiQuery(event.replyToken, textRaw, userId, { both: isPriceIntent && isStockIntent });
+  }
+
+  // 3) 明確單一指令（相容舊版）：查價 XXX / 庫存 XXX
   if (/^(查價|報價)/.test(textRaw)) {
     const keyword = textRaw.replace(/^(查價|報價)/, '').trim();
     return replyPrice(event.replyToken, userId, keyword);
@@ -97,8 +95,8 @@ async function handleEvent(event) {
     '您可以輸入：\n' +
     '• 查價 商品名\n' +
     '• 庫存 商品名\n' +
-    '• 下單 商品名 x 數量\n' +
-    '• 查編號 商品名（只顯示 代碼｜書名）'
+    '• 下單 商品名 x 數量\n\n' +
+    '也支援多行多書名輸入（逐行查詢）。'
   );
 }
 
@@ -111,23 +109,128 @@ async function getProfileSafe(userId) {
 }
 
 async function replyText(token, text) {
+  // LINE 單則訊息長度上限保守切分
   const chunks = chunkMessage(text, 1400);
   const messages = chunks.map(t => ({ type: 'text', text: t }));
   return client.replyMessage(token, messages);
 }
 
-// ===== 文字正規化 =====
-function normalizeText(str) {
-  return (str || '')
-    .toLowerCase()
-    .replace(/[的了著嗎呢啊喔呀哦耶]/g, '') // 去語助詞
-    .replace(/\s+/g, '')
+// ===== 多書名處理 =====
+function stripIntents(text) {
+  return text
+    .replace(/(^|\s)(查價|報價|多少錢)/g, ' ')
+    .replace(/(^|\s)(庫存|有貨嗎|有沒有庫存|缺貨嗎)/g, ' ')
     .trim();
 }
+function splitKeywords(text) {
+  const cleaned = stripIntents(text);
+  const parts = cleaned
+    .split(/\n|、|,|，|；|;/)
+    .map(s => s.trim())
+    .filter(Boolean);
+  return parts;
+}
 
-// ===== 產品讀取（縱向：每列一筆） =====
+async function handleMultiQuery(replyToken, textRaw, userId, options = {}) {
+  const list = await fetchProducts();
+  const wantsPrice = /(^|\n|\s)(查價|報價|多少錢)/.test(textRaw);
+  const wantsStock = /(^|\n|\s)(庫存|有貨嗎|有沒有庫存|缺貨嗎)/.test(textRaw);
+
+  let keywords = splitKeywords(textRaw);
+
+  // 如果是「只問庫存且沒有任何關鍵字」→ 用上一批記憶
+  if (wantsStock && !wantsPrice && keywords.length === 0) {
+    const last = getLastKeywords(userId);
+    if (last.length > 0) {
+      keywords = last.map(p => p.code || p.name);
+    } else {
+      return replyText(replyToken, '請輸入品名或代碼。');
+    }
+  }
+
+  if (keywords.length === 0) {
+    return replyText(replyToken, '請輸入品名或代碼。');
+  }
+
+  const blocks = [];
+  const rememberedItems = []; // 用於覆蓋記憶
+  for (const kw of keywords) {
+    const result = searchProductFuzzy(list, kw);
+    if (!result) {
+      blocks.push(`找不到「${kw}」，請確認品名或代碼。`);
+      continue;
+    }
+    if (result.multi) {
+      const lines = result.multi.map(p => `${p.code}｜${p.name}`).join('\n');
+      blocks.push(`找到多個相似品項：\n${lines}\n請輸入更明確的品名或代碼。`);
+      // 不把多選模糊清單記憶，以免不精確
+      continue;
+    }
+    const item = result;
+    rememberedItems.push({ code: item.code, name: item.name });
+
+    const priceLine = `定價：${item.price} 元`;
+    const stockLine = normalizeStockText(item);
+    let block = `《${item.name}》\n`;
+    if (wantsPrice || (!wantsPrice && !wantsStock)) block += `${priceLine}\n`;
+    if (wantsStock || (!wantsPrice && !wantsStock)) block += `庫存：${stockLine}`;
+    blocks.push(block.trim());
+  }
+
+  // 記憶此次成功命中的清單（若有）
+  if (rememberedItems.length > 0) setLastKeywords(userId, rememberedItems);
+
+  const joined = blocks.join('\n\n');
+  return replyText(replyToken, joined);
+}
+
+// ===== 單筆查價/庫存（相容舊版呼叫，並寫入記憶） =====
+async function replyPrice(token, userId, keyword) {
+  const list = await fetchProducts();
+  const item = searchProductFuzzy(list, keyword);
+  if (!item) return replyText(token, `找不到「${keyword}」，請確認品名或代碼。`);
+  if (item.multi) {
+    const names = item.multi.map(p => `${p.code}｜${p.name}`).join('\n');
+    return replyText(token, `找到多個相似品項：\n${names}\n請輸入更明確的品名或代碼。`);
+  }
+  setLastKeywords(userId, [{ code: item.code, name: item.name }]);
+  const stockText = normalizeStockText(item);
+  return replyText(token, `《${item.name}》\n定價：${item.price} 元\n庫存：${stockText}`);
+}
+
+async function replyStock(token, userId, keyword) {
+  const list = await fetchProducts();
+  // 若未提供關鍵字 → 使用記憶清單
+  if (!keyword || !keyword.trim()) {
+    const last = getLastKeywords(userId);
+    if (last.length === 0) return replyText(token, '請輸入品名或代碼。');
+    const blocks = [];
+    for (const p of last) {
+      const found = searchProductFuzzy(list, p.code || p.name);
+      if (!found || found.multi) continue;
+      const stockText = normalizeStockText(found);
+      blocks.push(`《${found.name}》庫存：${stockText}`);
+    }
+    if (blocks.length === 0) return replyText(token, '請輸入品名或代碼。');
+    return replyText(token, blocks.join('\n\n'));
+  }
+
+  // 有關鍵字：正常流程
+  const item = searchProductFuzzy(list, keyword);
+  if (!item) return replyText(token, `找不到「${keyword}」，請確認品名或代碼。`);
+  if (item.multi) {
+    const names = item.multi.map(p => `${p.code}｜${p.name}`).join('\n');
+    return replyText(token, `找到多個相似品項：\n${names}\n請輸入更明確的品名或代碼。`);
+  }
+  setLastKeywords(userId, [{ code: item.code, name: item.name }]);
+  const stockText = normalizeStockText(item);
+  return replyText(token, `《${item.name}》庫存：${stockText}`);
+}
+
+// ===== Google Sheets 讀寫 =====
 async function fetchProducts() {
   const sheets = getSheets();
+  // 允許到 F 欄：code, name, price, stock, restock_eta, remarks
   const range = `${TAB_PRODUCTS}!A:F`;
   const resp = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
   const rows = resp.data.values || [];
@@ -145,46 +248,54 @@ async function fetchProducts() {
 }
 
 function normalizeStockText(item) {
+  // 支援「有/無」「數字庫存」「缺貨 + 預計補貨日」三型
   const s = (item.stock || '').toString().trim();
-  if (s === '') return item.restock_eta ? `缺貨，預計補貨日：${item.restock_eta}` : '缺貨';
-  if (/^(有|無)$/.test(s)) return s === '有' ? '有貨' : '缺貨';
+  if (s === '') return item.restock_eta ? `缺貨，預計補貨日：${item.restock_eta}` : '缺貨（待確認補貨日）';
+  if (/^(有|無)$/.test(s)) return s === '有' ? '有貨' : (item.restock_eta ? `缺貨，預計補貨日：${item.restock_eta}` : '缺貨');
   const n = Number(s);
-  if (!Number.isNaN(n)) return n > 0 ? `在庫中，可出 ${n}` : '缺貨';
-  return s; // 例如「調貨中」等文字
+  if (!Number.isNaN(n)) {
+    if (n > 0) return `在庫中，可出 ${n}`;
+    return item.restock_eta ? `缺貨，預計補貨日：${item.restock_eta}` : '缺貨';
+  }
+  return s; // 自由文字，例如「調貨中」、「門市限定」
 }
 
-// ===== 模糊搜尋（容錯拼字） =====
+// ===== 模糊搜尋 =====
 function searchProductFuzzy(list, keyword) {
-  const k = normalizeText(keyword);
+  const k = keyword.trim().toLowerCase();
   if (!k) return null;
 
   // 完全代碼命中
   const exact = list.find(p => p.code && p.code.toLowerCase() === k);
   if (exact) return exact;
 
-  // 包含比對（代碼、名稱）
+  // 代碼/名稱包含
   let matches = list.filter(p =>
     (p.code && p.code.toLowerCase().includes(k)) ||
-    (normalizeText(p.name).includes(k))
+    (p.name && p.name.toLowerCase().includes(k))
   );
 
-  // 若沒有包含比對結果，使用相似度演算法
+  // 字串相似度（Levenshtein）
   if (matches.length === 0) {
     const scored = list
-      .map(p => ({ item: p, score: similarity(normalizeText(p.name), k) }))
-      .filter(x => x.score >= 0.45) // 放寬門檻
+      .map(p => ({
+        item: p,
+        score: similarity((p.name || '').toLowerCase(), k)
+      }))
+      .filter(x => x.score >= 0.6)
       .sort((a, b) => b.score - a.score);
     matches = scored.map(x => x.item);
   }
 
   if (matches.length === 0) return null;
   if (matches.length === 1) return matches[0];
-  return { multi: matches.slice(0, 8) };
+  return { multi: matches.slice(0, 5) };
 }
 
-// Levenshtein + 相似度
+// Levenshtein Distance + 相似度
 function levenshtein(a, b) {
-  const an = a.length, bn = b.length;
+  const an = a ? a.length : 0;
+  const bn = b ? b.length : 0;
   if (an === 0) return bn;
   if (bn === 0) return an;
   const matrix = Array.from({ length: an + 1 }, () => new Array(bn + 1).fill(0));
@@ -211,59 +322,15 @@ function similarity(a, b) {
   return (longerLength - editDist) / parseFloat(longerLength);
 }
 
-// ===== 回覆：查價（顯示代碼） =====
-async function replyPrice(token, userId, keyword) {
-  const list = await fetchProducts();
-  const item = searchProductFuzzy(list, keyword);
-  if (!item) return replyText(token, `找不到「${keyword}」。`);
-  if (item.multi) {
-    const lines = item.multi.map(p => `${p.code ? p.code + '｜' : ''}${p.name}`).join('\n');
-    return replyText(token, `找到多個相似品項：\n${lines}`);
-  }
-  setLastKeywords(userId, [{ code: item.code, name: item.name }]);
-  const stockText = normalizeStockText(item);
-  const codeText = item.code ? `${item.code}｜` : '';
-  return replyText(token, `${codeText}${item.name}\n定價：${item.price} 元\n庫存：${stockText}`);
-}
-
-// ===== 回覆：庫存（顯示代碼） =====
-async function replyStock(token, userId, keyword) {
-  const list = await fetchProducts();
-  const item = searchProductFuzzy(list, keyword);
-  if (!item) return replyText(token, `找不到「${keyword}」。`);
-  if (item.multi) {
-    const lines = item.multi.map(p => `${p.code ? p.code + '｜' : ''}${p.name}`).join('\n');
-    return replyText(token, `找到多個相似品項：\n${lines}`);
-  }
-  setLastKeywords(userId, [{ code: item.code, name: item.name }]);
-  const stockText = normalizeStockText(item);
-  const codeText = item.code ? `${item.code}｜` : '';
-  return replyText(token, `${codeText}${item.name}\n庫存：${stockText}`);
-}
-
-// ===== 回覆：查編號（只顯示 代碼｜書名） =====
-async function replyCodeOnly(token, userId, keyword) {
-  const list = await fetchProducts();
-  const item = searchProductFuzzy(list, keyword);
-  if (!item) return replyText(token, `找不到「${keyword}」。`);
-  if (item.multi) {
-    const lines = item.multi.map(p => `${p.code ? p.code + '｜' : ''}${p.name}`).join('\n');
-    return replyText(token, `找到多個相似品項：\n${lines}`);
-  }
-  setLastKeywords(userId, [{ code: item.code, name: item.name }]);
-  const codeText = item.code ? `${item.code}｜` : '';
-  return replyText(token, `${codeText}${item.name}`);
-}
-
-// ===== 下單 =====
+// ===== 下單（沿用原有流程） =====
 async function replyOrder(token, profile, keyword, qty) {
   if (!qty || qty <= 0) return replyText(token, '數量需要是正整數。');
   const list = await fetchProducts();
   const item = searchProductFuzzy(list, keyword);
-  if (!item) return replyText(token, `找不到「${keyword}」。`);
+  if (!item) return replyText(token, `找不到「${keyword}」，請確認品名或代碼。`);
   if (item.multi) {
-    const lines = item.multi.map(p => `${p.code ? p.code + '｜' : ''}${p.name}`).join('\n');
-    return replyText(token, `找到多個相似品項：\n${lines}\n請輸入更明確的品名或代碼。`);
+    const names = item.multi.map(p => `${p.code}｜${p.name}`).join('\n');
+    return replyText(token, `找到多個相似品項：\n${names}\n請輸入更明確的品名或代碼。`);
   }
 
   const orderId = `ORD-${dayjs().format('YYYYMMDD')}-${Math.floor(Math.random()*9000+1000)}`;
@@ -287,16 +354,20 @@ async function replyOrder(token, profile, keyword, qty) {
     }
   });
   const stockText = normalizeStockText(item);
-  const codeText = item.code ? `${item.code}｜` : '';
-  return replyText(token, `已收到您的訂單：\n${codeText}${item.name} x ${qty}\n訂單編號：${orderId}\n${stockText}`);
+  return replyText(token, `已收到您的訂單：\n${item.name} x ${qty}\n訂單編號：${orderId}\n${stockText}`);
 }
 
 // ===== 工具 =====
 function chunkMessage(s, size = 1400) {
   const out = [];
-  for (let i = 0; i < s.length; i += size) out.push(s.slice(i, i + size));
+  let i = 0;
+  while (i < s.length) {
+    out.push(s.slice(i, i + size));
+    i += size;
+  }
   return out;
 }
 
+app.get('/', (req, res) => res.send('salesbot-line v3 running'));
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log('Server running on', port));

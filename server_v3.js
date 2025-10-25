@@ -1,4 +1,4 @@
-// server_v3.js — Unicode最終穩定版（查編號換行支援）
+// server_v3.js — SalesBot：查價/庫存功能 + 關閉下單提示 + 自動說明訊息
 import express from "express";
 import { Client, middleware } from "@line/bot-sdk";
 import dotenv from "dotenv";
@@ -8,12 +8,14 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// LINE Bot 設定
 const config = {
   channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.CHANNEL_SECRET,
 };
 const client = new Client(config);
 
+// Google Sheets API 設定
 const sheets = google.sheets("v4");
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON),
@@ -22,6 +24,7 @@ const auth = new google.auth.GoogleAuth({
 const sheetId = process.env.GOOGLE_SHEETS_ID;
 const tabProducts = process.env.SHEET_TAB_PRODUCTS || "products";
 
+// 取得商品資料
 async function fetchProducts() {
   const authClient = await auth.getClient();
   const res = await sheets.spreadsheets.values.get({
@@ -46,6 +49,7 @@ async function fetchProducts() {
   }));
 }
 
+// 模糊搜尋
 function searchProductFuzzy(list, keyword) {
   if (!keyword) return null;
   const normalized = keyword.replace(/\s+/g, "").toLowerCase();
@@ -57,10 +61,12 @@ function searchProductFuzzy(list, keyword) {
   return null;
 }
 
+// 回覆文字
 function replyText(token, text) {
   return client.replyMessage(token, { type: "text", text });
 }
 
+// 查編號
 async function replyCodeOnly(token, keyword) {
   const list = await fetchProducts();
   const cleaned = keyword.replace(/[\r\u2028\u2029\u3000\uFEFF]+/g, "\n");
@@ -80,6 +86,7 @@ async function replyCodeOnly(token, keyword) {
   return replyText(token, results.join("\n"));
 }
 
+// 查價／報價
 async function replyPrice(token, keyword) {
   const list = await fetchProducts();
   const item = searchProductFuzzy(list, keyword);
@@ -91,6 +98,7 @@ async function replyPrice(token, keyword) {
   return replyText(token, `${item.code} ${item.name}\n定價：${item.price} 元\n庫存：${item.stock}`);
 }
 
+// 查庫存
 async function replyStock(token, keyword) {
   const list = await fetchProducts();
   const item = searchProductFuzzy(list, keyword);
@@ -102,27 +110,54 @@ async function replyStock(token, keyword) {
   return replyText(token, `${item.code} ${item.name}\n庫存：${item.stock}`);
 }
 
+// 說明訊息
+const helpMessage = `
+嗨～這是上誼 SalesBot，您可以快速查詢商品資料：
+
+🔍 查價 商品名稱 → 查詢商品定價與庫存
+📦 庫存 商品名稱 → 查詢目前庫存數量
+🆔 查編號 商品名稱 → 查詢商品代碼
+
+小提醒：
+• 可同時輸入多行或多書名（系統會逐行查詢）
+• 支援模糊搜尋，不需完整輸入書名
+• 目前暫不開放下單功能
+`;
+
+// 主事件處理
 async function handleEvent(event) {
+  if (event.type === "follow") {
+    return client.replyMessage(event.replyToken, { type: "text", text: helpMessage });
+  }
+
   if (event.type !== "message" || event.message.type !== "text") return;
   const textRaw = (event.message.text ?? "").trim();
+
+  if (textRaw === "說明" || textRaw === "help" || textRaw === "Help") {
+    return replyText(event.replyToken, helpMessage);
+  }
+
   if (textRaw.startsWith("查編號")) {
-    const keyword = textRaw
-      .replace(/^查編號/, "")
-      .replace(/^[\s\r\n]+/, "")
-      .replace(/[\r\n\u2028\u2029\u3000\uFEFF]+/g, "\n")
-      .trim();
+    const keyword = textRaw.replace(/^查編號/, "").trim();
     return replyCodeOnly(event.replyToken, keyword);
   }
+
   if (/^(查價|報價)/.test(textRaw)) {
     const keyword = textRaw.replace(/^(查價|報價)/, "").trim();
     return replyPrice(event.replyToken, keyword);
   }
+
   if (/^庫存/.test(textRaw)) {
     const keyword = textRaw.replace(/^庫存/, "").trim();
     return replyStock(event.replyToken, keyword);
   }
+
+  if (/^下單/.test(textRaw)) {
+    return replyText(event.replyToken, "目前暫不開放下單功能喔。");
+  }
 }
 
+// webhook 接收事件
 app.post("/webhook", middleware(config), (req, res) => {
   Promise.all(req.body.events.map(handleEvent)).then(() => res.end());
 });

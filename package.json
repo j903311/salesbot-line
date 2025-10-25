@@ -1,16 +1,14 @@
 {
-  "name": "line-bot-sales-assistant",
-  "version": "3.0.0",
-  "description": "LINE Bot for pricing, stock, and order management (with fuzzy search & context memory)",
+  "name": "line-bot-salesbot",
+  "version": "1.0.0",
+  "description": "上誼 SalesBot：查價 / 庫存 / 查編號（無下單版）",
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "@line/bot-sdk": "^9.0.2",
-    "dayjs": "^1.11.11",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "googleapis": "^137.0.0"

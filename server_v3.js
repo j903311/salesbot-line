@@ -1,4 +1,4 @@
-// server_v3.js — SalesBot：查價/庫存功能 + 關閉下單提示 + 自動說明訊息
+// server_v3_fixed.js — SalesBot：修正版（移除 express.json 以修復 LINE 簽章驗證）
 import express from "express";
 import { Client, middleware } from "@line/bot-sdk";
 import dotenv from "dotenv";
@@ -6,7 +6,6 @@ import { google } from "googleapis";
 dotenv.config();
 
 const app = express();
-app.use(express.json());
 
 // LINE Bot 設定
 const config = {
@@ -41,7 +40,7 @@ async function fetchProducts() {
     price: header.indexOf("price"),
     stock: header.indexOf("stock"),
   };
-  return data.map(r => ({
+  return data.map((r) => ({
     code: (r[idx.code] ?? "").trim(),
     name: (r[idx.name] ?? "").trim(),
     price: (r[idx.price] ?? "").trim(),
@@ -53,9 +52,11 @@ async function fetchProducts() {
 function searchProductFuzzy(list, keyword) {
   if (!keyword) return null;
   const normalized = keyword.replace(/\s+/g, "").toLowerCase();
-  let exact = list.find(p => (p.name || "").replace(/\s+/g, "").toLowerCase() === normalized);
+  let exact = list.find(
+    (p) => (p.name || "").replace(/\s+/g, "").toLowerCase() === normalized
+  );
   if (exact) return exact;
-  const partial = list.filter(p => (p.name || "").toLowerCase().includes(normalized));
+  const partial = list.filter((p) => (p.name || "").toLowerCase().includes(normalized));
   if (partial.length === 1) return partial[0];
   if (partial.length > 1) return { multi: partial };
   return null;
@@ -92,10 +93,13 @@ async function replyPrice(token, keyword) {
   const item = searchProductFuzzy(list, keyword);
   if (!item) return replyText(token, `找不到「${keyword}」。`);
   if (item.multi) {
-    const lines = item.multi.map(p => `${p.code} ${p.name}`).join("\n");
+    const lines = item.multi.map((p) => `${p.code} ${p.name}`).join("\n");
     return replyText(token, `找到多個相似品項：\n${lines}`);
   }
-  return replyText(token, `${item.code} ${item.name}\n定價：${item.price} 元\n庫存：${item.stock}`);
+  return replyText(
+    token,
+    `${item.code} ${item.name}\n定價：${item.price} 元\n庫存：${item.stock}`
+  );
 }
 
 // 查庫存
@@ -104,7 +108,7 @@ async function replyStock(token, keyword) {
   const item = searchProductFuzzy(list, keyword);
   if (!item) return replyText(token, `找不到「${keyword}」。`);
   if (item.multi) {
-    const lines = item.multi.map(p => `${p.code} ${p.name}`).join("\n");
+    const lines = item.multi.map((p) => `${p.code} ${p.name}`).join("\n");
     return replyText(token, `找到多個相似品項：\n${lines}`);
   }
   return replyText(token, `${item.code} ${item.name}\n庫存：${item.stock}`);
@@ -157,7 +161,7 @@ async function handleEvent(event) {
   }
 }
 
-// webhook 接收事件
+// webhook 接收事件（注意：不要在 middleware 前加 express.json）
 app.post("/webhook", middleware(config), (req, res) => {
   Promise.all(req.body.events.map(handleEvent)).then(() => res.end());
 });

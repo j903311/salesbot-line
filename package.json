@@ -2,10 +2,10 @@
   "name": "line-bot-salesbot",
   "version": "1.0.0",
   "description": "上誼 SalesBot：查價 / 庫存 / 查編號（無下單版）",
-  "main": "server.js",
+  "main": "server_v3.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server_v3.js"
   },
   "dependencies": {
     "@line/bot-sdk": "^9.0.2",

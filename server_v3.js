@@ -1,4 +1,4 @@
-// server_v3_fixed.js — SalesBot：修正版（移除 express.json 以修復 LINE 簽章驗證）
+// server_v3.js — 修正版（修復 Google Sheets 憑證換行問題）
 import express from "express";
 import { Client, middleware } from "@line/bot-sdk";
 import dotenv from "dotenv";
@@ -16,8 +16,9 @@ const client = new Client(config);
 
 // Google Sheets API 設定
 const sheets = google.sheets("v4");
+const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON.replace(/\\n/g, '\n'));
 const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON),
+  credentials,
   scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
 });
 const sheetId = process.env.GOOGLE_SHEETS_ID;
@@ -161,7 +162,7 @@ async function handleEvent(event) {
   }
 }
 
-// webhook 接收事件（注意：不要在 middleware 前加 express.json）
+// webhook 接收事件
 app.post("/webhook", middleware(config), (req, res) => {
   Promise.all(req.body.events.map(handleEvent)).then(() => res.end());
 });

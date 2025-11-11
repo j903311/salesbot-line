@@ -1,4 +1,6 @@
-// server_v3.js — 修正版（修復 Google Sheets 憑證換行問題）
+process.env.NODE_OPTIONS = "--openssl-legacy-provider";
+
+// server_v3.js — 修正版（修復 Google Sheets 憑證換行問題 + OpenSSL 相容性）
 import express from "express";
 import { Client, middleware } from "@line/bot-sdk";
 import dotenv from "dotenv";

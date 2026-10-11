@@ -68,50 +68,6 @@ const lineClient = new LineClient({
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ownerUserId = process.env.OWNER_USER_ID;
-async function diagnoseKeys() {
-  const token = process.env.CHANNEL_ACCESS_TOKEN || "";
-  const aiKey = process.env.OPENAI_API_KEY || "";
-
-  console.log("🔍 LINE Token 診斷", {
-    exists: !!token,
-    length: token.length,
-    hasWhitespace: /\s/.test(token),
-    hasBearerPrefix: token.startsWith("Bearer ")
-  });
-
-  console.log("🔍 OpenAI Key 診斷", {
-    exists: !!aiKey,
-    looksLikePlaceholder: aiKey.includes("your_openai_api_key"),
-    hasSkPrefix: aiKey.startsWith("sk-")
-  });
-
-  try {
-    const response = await fetch(
-      "https://api.line.me/v2/oauth/verify",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: new URLSearchParams({
-          access_token: token
-        })
-      }
-    );
-
-    const data = await response.json();
-
-    console.log("🔍 LINE 官方驗證", {
-      status: response.status,
-      channelId: data.client_id || null,
-      valid: response.ok
-    });
-  } catch (err) {
-    console.error("🔍 LINE 驗證連線失敗:", err.message);
-  }
-}
-
-diagnoseKeys();
 
 // ======= 愛的模式（開關） =======
 let loveMode = false;
